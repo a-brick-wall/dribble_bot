@@ -1,0 +1,226 @@
+from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
+from rlbot.utils.structures.game_data_struct import GameTickPacket
+import math
+import numpy as np
+
+class TutorialBot(BaseAgent):
+
+    def __init__(self, name, team, index):
+        super().__init__(name, team, index)
+        self.controller = SimpleControllerState()
+
+        # Game values
+        self.bot_pos = None
+        self.bot_yaw = None
+        self.bot_vel = None
+    #ball x,y,z,dx,dy
+    def aim(self, target_x,target_y,target_z,ball_vel_x,ball_vel_y):
+
+        #functions for finding angle between two vectors
+        def unit_vector(vector):
+            return vector / np.linalg.norm(vector)
+
+        def angle_between(v1, v2):
+            v1_u = unit_vector(v1)
+            v2_u = unit_vector(v2)
+            return np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
+
+        #direction of ball relative to center of car (where should we aim)
+        angle_between_bot_and_target = math.atan2(target_y - self.bot_pos.y,
+                                                target_x - self.bot_pos.x)
+        #direction of ball relative to yaw of car (where should we aim verse where we are aiming)
+        angle_front_to_target = angle_between_bot_and_target - self.bot_yaw
+
+        #distance between bot and ball
+        distance = math.sqrt(((math.fabs(target_y - self.bot_pos.y))**2+(math.fabs(target_x - self.bot_pos.x))**2))
+
+        #direction of ball velocity relative to center of car (which way the ball is moving)
+        direction_of_ball = angle_between(((target_x - self.bot_pos.x),(target_y - self.bot_pos.y)),(ball_vel_x, ball_vel_y))
+
+        #direction of ball velocity relative to yaw of car (which way the ball is moving verse which way we are moving)
+        ball_angle_to_car = math.atan2(ball_vel_y,ball_vel_x)-self.bot_yaw
+        
+        #angle between car and future location of ball
+        roll_angle = math.atan2((target_y + .3*ball_vel_y)*1. - self.bot_pos.y,(target_x + .3*ball_vel_x)*1. - self.bot_pos.x) - self.bot_yaw
+
+        #similar to ball_angle_to_car but uses bot velocity vector instead
+        ball_bot_angle = angle_between((ball_vel_x,ball_vel_y),(self.bot_vel.x,self.bot_vel.y))
+
+        #magnitude of ball_bot_angle (squared)
+        ball_bot_diff = (ball_vel_x**2 + ball_vel_y**2)-(self.bot_vel.x**2 + self.bot_vel.y**2)
+
+        #p is the distance between ball and car, d is the relative speed between ball and car
+        #v is the magnitude of the ball's velocity (squared) it's like the i term which would normally
+        #be the integral of p over time, but the ball's velocity is essentially that number
+        #bouncing a ball is distinctly different than balancing something
+        p = 0.
+        d = 0.
+        v = 0.
+        p_s = 0.
+        i_s = 0.
+        d_s = 0.
+
+        #this is the amount where we "full steer" anything less is the angle divided by the steer constant
+        steer_const = 45.
+
+        #speed of ball to be used in deciding whether the bot should approach the ball
+        speed = math.sqrt(ball_vel_x**2 + ball_vel_y**2)
+
+        #speed of car to be used when deciding how much to accelerate when approaching the ball
+        car_speed = math.sqrt(self.bot_vel.x**2 + self.bot_vel.y**2)
+
+        
+        # Remap angles between +/- pi
+        if angle_front_to_target < -math.pi:
+            angle_front_to_target += 2 * math.pi
+        if angle_front_to_target > math.pi:
+            angle_front_to_target -= 2 * math.pi
+
+        if roll_angle < -math.pi:
+            roll_angle += 2 * math.pi
+        if roll_angle > math.pi:
+            roll_angle -= 2 * math.pi
+
+        if direction_of_ball < -math.pi:
+            direction_of_ball += 2 * math.pi
+        if direction_of_ball > math.pi:
+            direction_of_ball -= 2 * math.pi
+
+        if ball_angle_to_car < -math.pi:
+            ball_angle_to_car += 2 * math.pi
+        if ball_angle_to_car > math.pi:
+            ball_angle_to_car -= 2 * math.pi
+
+        #we modify distance and ball_bot_diff so that only the component along the car's path is counted
+        #if the ball is too far to the left, we don't want the bot to think it has to drive forward
+        #to catch it
+        distance_y = math.fabs(distance*math.cos(angle_front_to_target))
+        distance_x = math.fabs(distance*math.sin(angle_front_to_target))
+        ball_bot_diff_y = ball_bot_diff*math.cos(angle_front_to_target)
+        ball_bot_diff_x = ball_bot_diff*math.sin(angle_front_to_target)
+        
+
+        #ball moving forward WRT car yaw?
+        forward = False
+        if math.fabs(ball_angle_to_car) < math.radians(90):
+            forward = True
+        #print (forward)
+
+        #this section is the standard approach
+        #the car quickly gets to the general area of the ball, then drives slow until it is very close
+        #then begins balancing
+        if (distance>900):
+            self.controller.throttle = 1.
+            self.controller.boost = False
+        #we limit the speed to 300 to ensure a slow approach
+        elif distance>400 and distance<900 and car_speed>300:
+            self.controller.throttle = -1
+        elif (distance>400):
+            self.controller.throttle = .1
+            self.controller.boost = False
+        #this is the balancing PID section
+        #it always starts with full boost/throttle bc the bot thinks the ball is too far in front
+        #opposite is true for behind
+        else:
+            #first we give the distance values signs
+            if forward == True:
+                d = ball_bot_diff
+                v = (ball_vel_x**2 + ball_vel_y**2)
+            else:
+                d = -ball_bot_diff
+                v = -(ball_vel_x**2 + ball_vel_y**2)
+            if math.fabs(math.degrees(angle_front_to_target)) < 90:
+                p = distance_y
+            else:
+                p = -1*distance_y
+            #this is the PID correction.  all of the callibration goes on right here
+            #there is literature about how to set the variables but it doesn't work quite the same
+            #because the car is only touching the ball (and interacting with the system) on bounces
+            #we run the PID formula through tanh to give a value between -1 and 1
+            correction = np.tanh((20*p+.0008*v+.006*d)/700)
+            #print(correction,p,math.degrees(angle_front_to_target))
+            self.controller.throttle = correction*.99
+            #anything over .9 is boost
+            if correction>.9:
+                self.controller.boost = True
+            else:
+                self.controller.boost = False
+
+            #good print statement for callibration
+            #print(20*p, .0003*v, .006*d, correction,self.controller.throttle)
+            
+        #if the ball gets away from the 400 distance balancing spot, but is almost directly behind
+        #we go full reverse straight.  this isn't as useful on normal settings, but is helpful
+        #for avoiding driving in circles in large bouncy ball settings
+        if ((distance>400 and distance<700) and (math.fabs(angle_front_to_target) > math.radians(45))):
+            self.controller.boost = False
+            self.controller.steer = 0
+            self.controller.throttle = -1.
+        
+        #these two elif statements may need some work
+        #this one points the car to the direction the ball is going if the ball is just behind the car and moving forwards
+        elif (distance<400):
+
+            p_s = math.fabs(distance_x)
+            i_s = 0
+            d_s = math.fabs(ball_bot_diff_x)
+            
+            if ball_angle_to_car < 0:
+                p_s = -p_s
+                d_s = -d_s
+            if forward == False:
+                d_s = -d_s
+            correction = np.tanh((20*p_s+.0008*i_s+.006*d_s)/700)
+            self.controller.steer = correction
+            print(ball_angle_to_car, 20*p_s, .006*d_s, correction)
+
+        elif distance == 9000:
+            print("hi")
+        elif (distance>400 and speed>80 and direction_of_ball<math.radians(120) and target_z<100):
+            self.controller.throttle = 0.
+
+            #before I had the car drive to where the ball was going, but it kept running into the ball on the way
+            #if roll_angle < math.radians(-steer_const):
+            #    self.controller.steer = -1
+            #elif roll_angle > math.radians(steer_const):
+            #    self.controller.steer = 1
+            #else:
+            #    self.controller.steer = math.degrees(roll_angle)/steer_const
+
+        #while the bot is balancing the ball, the next statement occurs
+        #it causes the bot to gently steer under the ball
+        #the steering angle can be decreased for more forceful steering and vice versa
+        elif distance>20:
+            if distance_y>40:
+                if angle_front_to_target < math.radians(-steer_const):
+                    self.controller.steer = -1
+                elif angle_front_to_target > math.radians(steer_const):
+                    self.controller.steer = 1
+                else:
+                    self.controller.steer = math.degrees(angle_front_to_target)/steer_const
+            else:
+                if roll_angle < math.radians(-steer_const):
+                    self.controller.steer = -1
+                elif roll_angle > math.radians(steer_const):
+                    self.controller.steer = 1
+                else:
+                    self.controller.steer = math.degrees(roll_angle)/steer_const
+        #below distance 20 just go straight
+        else:
+            self.controller.steer = 0.
+        
+
+    def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
+        # Update game data variables
+        self.bot_yaw = packet.game_cars[self.team].physics.rotation.yaw
+        self.bot_pos = packet.game_cars[self.index].physics.location
+        self.bot_vel = packet.game_cars[self.index].physics.velocity
+
+        ball_pos = packet.game_ball.physics.location
+        ball_vel = packet.game_ball.physics.velocity
+
+        self.aim(ball_pos.x, ball_pos.y,ball_pos.z,ball_vel.x,ball_vel.y)
+        #print(self.controller.steer, self.controller.throttle,math.sqrt(((math.fabs(ball_pos.y - self.bot_pos.y))**2+(math.fabs(ball_pos.x - self.bot_pos.x))**2)))
+
+
+        return self.controller
